@@ -154,6 +154,13 @@ use derive_more::{Deref, DerefMut};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
+#[cfg(feature = "tokio")]
+use std::{pin::{pin, Pin}, task::{Context, Poll}};
+#[cfg(feature = "tokio")]
+use pin_project::pin_project;
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
 /// A terminal restorer, which keeps the previous state of the terminal, and restores it, when
 /// dropped.
 ///
@@ -206,8 +213,10 @@ use std::ops;
 
 /// Wraps a file descriptor for a TTY with a guard which saves
 /// the terminal mode on creation and restores it on drop.
+#[cfg_attr(feature = "tokio", pin_project)]
 pub struct TtyWithGuard<T: AsRawFd> {
     guard: TtyModeGuard,
+    #[cfg_attr(feature = "tokio", pin)]
     inner: T,
 }
 
@@ -280,12 +289,51 @@ impl<R: io::Write + AsRawFd> io::Write for TtyWithGuard<R> {
     }
 }
 
+#[cfg(feature = "tokio")]
+impl<R: AsyncRead + AsRawFd> AsyncRead for TtyWithGuard<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<(), io::Error>> {
+        let self_ = self.project();
+        self_.inner.poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<R: AsyncWrite + AsRawFd> AsyncWrite for TtyWithGuard<R> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
+        let self_ = self.project();
+        self_.inner.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let self_ = self.project();
+        self_.inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let self_ = self.project();
+        self_.inner.poll_shutdown(cx)
+    }
+}
+
 #[derive(Deref, DerefMut)]
 pub struct RawReader<T: Read + AsRawFd>(TtyWithGuard<T>);
 
 impl<R: Read + AsRawFd> Read for RawReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+#[pin_project]
+#[derive(Deref, DerefMut)]
+pub struct RawAsyncReader<T: AsyncRead + AsRawFd>(#[pin] TtyWithGuard<T>);
+
+#[cfg(feature = "tokio")]
+impl<R: AsyncRead + AsRawFd> AsyncRead for RawAsyncReader<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<(), io::Error>> {
+        let self_ = self.project();
+        self_.0.poll_read(cx, buf)
     }
 }
 
@@ -308,11 +356,26 @@ impl<T: Read + AsRawFd> IntoRawMode for T {
     }
 }
 
+#[cfg(feature = "tokio")]
+pub trait IntoRawModeAsync: AsyncRead + AsRawFd + Sized {
+    fn into_raw_mode_async(self) -> io::Result<RawAsyncReader<Self>>;
+}
+
+#[cfg(feature = "tokio")]
+impl<T: AsyncRead + AsRawFd> IntoRawModeAsync for T {
+    fn into_raw_mode_async(self) -> io::Result<RawAsyncReader<T>> {
+        let mut x = TtyWithGuard::new(self)?;
+        x.set_raw_mode()?;
+        Ok(RawAsyncReader(x))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use std::io::{self, stdin, stdout, Write};
-    use std::os::unix::io::AsRawFd;
+    #[cfg(feature = "tokio")]
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_into_raw_mode() -> io::Result<()> {
@@ -321,6 +384,19 @@ mod test {
         let mut out = stdout();
 
         out.write_all(b"testing, 123\r\n")?;
+
+        drop(out);
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_into_raw_mode_async() -> io::Result<()> {
+        let mut stdin = tokio::io::stdin().guard_mode()?;
+        stdin.set_raw_mode()?;
+        let mut out = tokio::io::stdout();
+
+        out.write_all(b"testing, 123\r\n").await?;
 
         drop(out);
         Ok(())

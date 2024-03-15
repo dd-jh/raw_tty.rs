@@ -12,3 +12,12 @@ license = "Apache-2.0 OR MIT"
 [dependencies]
 libc = "0.2.55"
 derive_more = "0.14.0"
+pin-project = { version = "1", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-std", "macros", "rt", "io-util"] }
+
+[features]
+default = []
+tokio = ["dep:tokio", "dep:pin-project"]
